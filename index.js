@@ -5,9 +5,10 @@ const axios = require('axios');
 const path = require('path');
 
 const app = express();
-app.use(express.json());
 
-// פונקציית עזר להורדת התמונה
+// הגדלת המגבלה כדי שנוכל לקבל JSON ענק של קוקיז
+app.use(express.json({ limit: '50mb' }));
+
 async function downloadImage(url, filepath) {
     const response = await axios({
         url,
@@ -22,18 +23,17 @@ async function downloadImage(url, filepath) {
 }
 
 app.post('/update-avatar', async (req, res) => {
-    // שליפת הנתונים מהבקשה של Make
-    const { email, password, contactUrl, imageUrl } = req.body;
+    // שים לב: אנחנו לא מבקשים יותר מייל וסיסמה
+    let { cookies, contactUrl, imageUrl } = req.body;
 
-    if (!email || !password || !contactUrl || !imageUrl) {
-        return res.status(400).send({ error: 'Missing parameters: email, password, contactUrl, or imageUrl' });
+    if (!cookies || !contactUrl || !imageUrl) {
+        return res.status(400).send({ error: 'Missing parameters: cookies, contactUrl, or imageUrl' });
     }
 
-    console.log(`[START] Processing for URL: ${contactUrl}`);
+    console.log(`[START] Processing with Cookies for: ${contactUrl}`);
     
     let browser = null;
     try {
-        // הרצת הדפדפן (מותאם גם לשרת וגם ללוקאלי)
         browser = await puppeteer.launch({
             headless: "new",
             args: [
@@ -46,79 +46,71 @@ app.post('/update-avatar', async (req, res) => {
         });
 
         const page = await browser.newPage();
-        // הגדרת User Agent כדי לא להיראות חשודים
+        
+        // --- שלב 1: הזרקת הקוקיז ---
+        console.log('Injecting cookies...');
+        
+        // אם הקוקיז הגיעו כסטרינג (קורה לפעמים במייק), נהפוך אותם לאובייקט
+        if (typeof cookies === 'string') {
+            try {
+                cookies = JSON.parse(cookies);
+            } catch (e) {
+                console.error('Warning: Cookies came as string, parsing...');
+            }
+        }
+
+        if (Array.isArray(cookies)) {
+            await page.setCookie(...cookies);
+        } else {
+            throw new Error('Invalid cookies format. Must be an array.');
+        }
+
+        // --- שלב 2: כניסה ישירה (בלי לוגין) ---
+        console.log(`Navigating directly to contact...`);
+        // מגדירים User Agent כדי להיראות אנושיים
         await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
-
-        // --- שלב 1: לוגין ---
-        console.log('Logging in...');
-        await page.goto('https://app.gohighlevel.com/', { waitUntil: 'networkidle2', timeout: 60000 });
         
-        await page.type('input[type="email"]', email);
-        await page.type('input[type="password"]', password);
-        
-        // לחיצה על כפתור הלוגין והמתנה לניווט
-        await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2' }),
-            page.click('button[type="submit"]')
-        ]);
-
-        console.log('Login successful, waiting for dashboard...');
-        // השהיה קטנה לוודא שהקוקיז נשמרו
-        await new Promise(r => setTimeout(r, 3000));
-
-        // --- שלב 2: כניסה לכרטיס ---
-        console.log(`Navigating to contact: ${contactUrl}`);
         await page.goto(contactUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-        // --- שלב 3: הכנת התמונה ---
+        // בדיקת בטיחות: האם נזרקנו לדף לוגין למרות הקוקיז?
+        if (page.url().includes('login')) {
+            throw new Error('Cookies rejected - Redirected to login page');
+        }
+
+        // --- שלב 3: הורדת התמונה ---
         const localImagePath = path.resolve(__dirname, 'temp_avatar.jpg');
         await downloadImage(imageUrl, localImagePath);
-        console.log('Image downloaded locally.');
+        console.log('Image downloaded.');
 
         // --- שלב 4: העלאה ---
-        console.log('Attempting to upload...');
-        
-        // איתור ה-Input הנסתר של הקובץ
-        // ב-GHL זה בדרך כלל input[type="file"] שחבוי בתוך האלמנטים
+        console.log('Uploading image...');
         const fileInput = await page.$('input[type="file"]');
         
         if (fileInput) {
             await fileInput.uploadFile(localImagePath);
-            console.log('File injected into input.');
-
-            // המתנה ל-Upload שיתבצע
+            console.log('File uploaded.');
+            
+            // המתנה לעיבוד
             await new Promise(r => setTimeout(r, 5000));
             
-            // לחיצה על כפתור שמירה בחלון הקרופ (אם קיים)
-            // ננסה למצוא כפתור שמכיל את המילה Save או Confirm
+            // לחיצה על כפתור שמירה/קרופ אם יש
             try {
                 const saveButtons = await page.$x("//button[contains(., 'Save') or contains(., 'Done') or contains(., 'Upload')]");
                 if (saveButtons.length > 0) {
                     await saveButtons[0].click();
-                    console.log('Clicked Save/Crop button.');
                     await new Promise(r => setTimeout(r, 3000));
                 }
-            } catch (e) {
-                console.log('No extra Save button found or needed.');
-            }
-            
+            } catch (e) {}
+
         } else {
-            throw new Error('Could not find file input element on the page.');
+            throw new Error('File input not found. Are you sure the page loaded correctly?');
         }
 
-        console.log('[SUCCESS] Image updated!');
+        console.log('[SUCCESS] Done.');
         res.status(200).send({ status: 'Success', message: 'Image updated successfully' });
 
     } catch (error) {
         console.error('[ERROR]', error);
-        // צילום מסך במקרה של שגיאה (עוזר לדיבאג בלוגים)
-        if (browser) {
-            try {
-                const page = (await browser.pages())[0];
-                const screenshotBuffer = await page.screenshot({ encoding: 'base64' });
-                console.log('Screenshot (Base64 error debug):', screenshotBuffer.substring(0, 100) + '...');
-            } catch (e) {}
-        }
         res.status(500).send({ status: 'Error', error: error.message });
     } finally {
         if (browser) await browser.close();
