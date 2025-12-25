@@ -37,96 +37,108 @@ app.post('/update-avatar', async (req, res) => {
     try {
         console.log(`[START] Processing request for: ${contactUrl}`);
         
-        // השקה של הדפדפן
         browser = await puppeteer.launch({
             headless: "new",
+            // התעלמות מדגלים שמסגירים אוטומציה
+            ignoreDefaultArgs: ["--enable-automation"],
             args: [
+                "--disable-blink-features=AutomationControlled", // הדגל הכי חשוב להסתרה!
                 "--disable-setuid-sandbox",
                 "--no-sandbox",
                 "--single-process",
                 "--no-zygote",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--window-size=1920,1080" // פותחים חלון גדול כדי שאלמנטים לא יהיו מוסתרים
+                "--window-size=1920,1080"
             ],
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
         });
 
         const page = await browser.newPage();
-        // נותנים לבוט זמן המתנה ארוך לפני שהוא מתייאש (60 שניות)
         page.setDefaultTimeout(60000); 
+
+        // טריק נוסף להסתרת הרובוט
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+            });
+        });
 
         // הזרקת קוקיז
         if (typeof cookies === 'string') cookies = JSON.parse(cookies);
         await page.setCookie(...cookies);
 
-        // ניווט לדף
-        console.log(`[NAVIGATE] Going to URL...`);
+        // שלב 1: חימום - כניסה לדף הבית של המערכת קודם
+        // זה עוזר לעבור בדיקות אבטחה של Cloudflare/GHL
+        const domain = new URL(contactUrl).origin; // למשל https://app.stanga.ai
+        console.log(`[WARMUP] Navigating to dashboard root first: ${domain}`);
+        await page.goto(domain, { waitUntil: 'networkidle2' }); // מחכים שהדף הראשי ייטען
+        
+        console.log('[WAIT] Sleeping 5s after warmup...');
+        await new Promise(r => setTimeout(r, 5000));
+
+        // שלב 2: כניסה לליד
+        console.log(`[NAVIGATE] Now going to specific contact URL...`);
         await page.goto(contactUrl, { waitUntil: 'domcontentloaded' });
         
-        // *** תוספת קריטית: המתנה "טיפשה" של 10 שניות ***
-        // נותנים ל-React של GHL לסיים לרנדר את כל הדף
-        console.log('[WAIT] Sleeping for 10 seconds to let GHL render...');
+        console.log('[WAIT] Sleeping for 10 seconds to let Contact page render...');
         await new Promise(r => setTimeout(r, 10000));
 
-        // בדיקה: איפה אנחנו נמצאים?
-        const currentUrl = page.url();
+        // בדיקת מצב הדף
         const pageTitle = await page.title();
-        console.log(`[STATUS] Current Page Title: "${pageTitle}"`);
-        console.log(`[STATUS] Current URL: "${currentUrl}"`);
+        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 200)); // הצצה לתוכן הדף
+        
+        console.log(`[STATUS] Page Title: "${pageTitle}"`);
+        console.log(`[STATUS] Page Content Preview: "${bodyText.replace(/\n/g, ' ')}..."`);
 
-        if (currentUrl.includes('login')) {
-            throw new Error(`Redirected to Login Page! Cookies might be invalid or expired. Title: ${pageTitle}`);
+        if (!pageTitle || pageTitle.trim() === "") {
+            throw new Error(`Page loaded but title is empty! The app probably crashed or blocked us.`);
+        }
+
+        if (page.url().includes('login')) {
+            throw new Error('Redirected to Login Page! Cookies invalid.');
         }
 
         // הורדת תמונה
         const localImagePath = path.resolve(__dirname, 'temp_avatar.jpg');
         await downloadImage(imageUrl, localImagePath);
         
-        // חיפוש כפתור ההעלאה
+        // חיפוש Input
         console.log('[UPLOAD] Looking for file input...');
-        // מנסים לחפש שוב עם זמן נדיב
-        const fileInput = await page.waitForSelector('input[type="file"]', { timeout: 20000 });
+        
+        // נסיון למצוא את האינפוט גם אם הוא מוסתר
+        // לפעמים ב-GHL האינפוט נוצר רק אחרי שהעכבר זז, אז נזיז אותו קצת
+        await page.mouse.move(100, 100);
+        await page.mouse.move(200, 200);
+
+        const fileInput = await page.waitForSelector('input[type="file"]', { timeout: 15000 });
         
         if (fileInput) {
-            console.log('[UPLOAD] Input found! Uploading file...');
+            console.log('[UPLOAD] Input found! Uploading...');
             await fileInput.uploadFile(localImagePath);
             
-            await new Promise(r => setTimeout(r, 5000)); // מחכים שההעלאה תתפוס
+            await new Promise(r => setTimeout(r, 5000));
             
-            // לחיצה על כפתור שמירה אם קיים
+            // ניסיון לשמור
             console.log('[SAVE] Looking for save button...');
             try {
                 const saveBtn = await page.$x("//button[contains(., 'Save') or contains(., 'Done') or contains(., 'Upload')]");
                 if (saveBtn.length > 0) {
                     await saveBtn[0].click();
-                    console.log('[SAVE] Save button clicked.');
+                    console.log('[SAVE] Clicked.');
                     await new Promise(r => setTimeout(r, 3000));
                 }
             } catch (e) {
-                console.log('[SAVE] Info: No explicit save button clicked (might be auto-save).');
+                console.log('[SAVE] Skip save click.');
             }
-        } else {
-            throw new Error(`File input not found on page: "${pageTitle}"`);
         }
 
-        console.log('[SUCCESS] Finished successfully.');
-        res.status(200).send({ 
-            status: 'Success', 
-            pageTitle: pageTitle,
-            finalUrl: currentUrl 
-        });
+        console.log('[SUCCESS] Finished.');
+        res.status(200).send({ status: 'Success', pageTitle });
 
     } catch (error) {
         console.error('[ERROR]', error.message);
-        res.status(500).send({ 
-            status: 'Error', 
-            error: error.message,
-            // מחזירים את הפרטים כדי שנדע ב-Make מה קרה
-            debugInfo: {
-                details: "Check Render logs for more info"
-            }
-        });
+        res.status(500).send({ status: 'Error', error: error.message });
     } finally {
         if (browser) await browser.close();
         if (fs.existsSync('temp_avatar.jpg')) fs.unlinkSync('temp_avatar.jpg');
